@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Build
+build/
+dist/
+
+# ROS
+install/
+log/
+
+# VSCode
+.vscode/
+
+# Env
+.env
