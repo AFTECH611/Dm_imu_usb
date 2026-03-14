@@ -5,135 +5,109 @@
 
 namespace dm_imu {
 
-// ══════════════════════════════════════════════════════════════════
-//  Primitive types
-// ══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+//  ImuObservation — 64 bytes, aligned to one cache line.
+//
+//  EKF quaternion luôn có (RID_QUAT từ IMU firmware).
+//  Không có Euler fallback, không có quat_from_imu flag.
+//
+//  RL policy input layout (10 floats liên tiếp từ offset 0):
+//    [qw qx qy qz | gyr_x gyr_y gyr_z | acc_x acc_y acc_z]
+//  → memcpy 40 bytes thẳng vào tensor input
+// ═══════════════════════════════════════════════════════════════════
 
-struct Vec3 {
-    float x{0.f}, y{0.f}, z{0.f};
-    float norm() const { return std::sqrt(x*x + y*y + z*z); }
-    Vec3 operator-(const Vec3& o) const { return {x-o.x, y-o.y, z-o.z}; }
-    Vec3 operator+(const Vec3& o) const { return {x+o.x, y+o.y, z+o.z}; }
-    Vec3 operator*(float s)       const { return {x*s,   y*s,   z*s};   }
-};
+struct alignas(64) ImuObservation {
+    // ── Orientation — EKF quaternion ZYX ──────────── offset  0 (16B)
+    float qw{1.f};
+    float qx{0.f};
+    float qy{0.f};
+    float qz{0.f};
 
-struct Quaternion {
-    float w{1.f}, x{0.f}, y{0.f}, z{0.f};
-    float norm() const { return std::sqrt(w*w + x*x + y*y + z*z); }
-    Quaternion normalized() const {
-        float n = norm();
-        if (n < 1e-6f) return {1.f, 0.f, 0.f, 0.f};
-        return {w/n, x/n, y/n, z/n};
+    // ── Angular velocity (rad/s) ──────────────────── offset 16 (12B)
+    float gyr_x{0.f};   // roll-rate  (body X)
+    float gyr_y{0.f};   // pitch-rate (body Y)
+    float gyr_z{0.f};   // yaw-rate   (body Z)
+
+    // ── Linear acceleration (m/s²) ────────────────── offset 28 (12B)
+    float acc_x{0.f};
+    float acc_y{0.f};
+    float acc_z{0.f};
+
+    // ── Timing ────────────────────────────────────── offset 40  (8B)
+    uint64_t timestamp_ns{0};   // CLOCK_MONOTONIC_RAW
+
+    // ── Sequence ──────────────────────────────────── offset 48  (4B)
+    uint32_t seq{0};   // monotonic; RL: seq != prev+1 → dropped tick
+
+    // ── Status ────────────────────────────────────── offset 52  (1B)
+    uint8_t valid{0};
+
+    uint8_t _pad[11]{};   // → total 64 bytes ✓
+
+    // ── Inline geometry (zero-cost, no stored Euler) ───────────────
+    float pitch_rad() const noexcept {
+        float s = 2.f * (qw*qy - qz*qx);
+        if (s >=  1.f) return  1.5707963f;
+        if (s <= -1.f) return -1.5707963f;
+        return std::asin(s);
+    }
+    float roll_rad() const noexcept {
+        return std::atan2(2.f*(qw*qx + qy*qz),
+                          1.f - 2.f*(qx*qx + qy*qy));
+    }
+    float yaw_rad() const noexcept {
+        return std::atan2(2.f*(qw*qz + qx*qy),
+                          1.f - 2.f*(qy*qy + qz*qz));
+    }
+    float accel_norm() const noexcept {
+        return std::sqrt(acc_x*acc_x + acc_y*acc_y + acc_z*acc_z);
     }
 };
+static_assert(sizeof(ImuObservation)  == 64);
+static_assert(alignof(ImuObservation) == 64);
 
-// ══════════════════════════════════════════════════════════════════
-//  ImuObservation — kết quả của getObs()
-// ══════════════════════════════════════════════════════════════════
-struct ImuObservation {
-    Vec3       accel;
-    Vec3       angular_velocity;
-    Quaternion quaternion;
 
-    float roll {0.f};   // độ, [-180, 180]  — TIN CẬY (tham chiếu trọng lực)
-    float pitch{0.f};   // độ, [-90,  90 ]  — TIN CẬY (tham chiếu trọng lực)
-    float yaw  {0.f};   // độ, [-180, 180]  — DRIFT (không có magnetometer)
+// ═══════════════════════════════════════════════════════════════════
+//  LocomotionState — derived, computed on-demand (safety monitor).
+//  RL policy dùng ImuObservation trực tiếp.
+// ═══════════════════════════════════════════════════════════════════
 
-    std::chrono::steady_clock::time_point timestamp{};
-    bool valid        {false};
-    bool quat_from_imu{false};
-};
-
-// ══════════════════════════════════════════════════════════════════
-//  LocomotionState — trạng thái dẫn xuất cho bộ điều khiển robot
-// ══════════════════════════════════════════════════════════════════
-/**
- * @brief Trạng thái locomotion tính từ ImuObservation.
- *
- * ⚠️  YAW DRIFT LÀ BÌNH THƯỜNG với 6-axis IMU (không có magnetometer).
- *     DM-IMU-L1 chỉ có accel + gyro → không có tham chiếu heading tuyệt đối.
- *     Gyro bias tích phân → yaw trôi liên tục, đặc biệt khi đứng yên.
- *
- *     Cách xử lý đúng cho humanoid:
- *       1. Dùng yaw_rate (°/s) thay vì yaw_rad cho steering control
- *          → yaw_rate từ gyro là chính xác trong ngắn hạn
- *       2. Gọi imu.zeroAngle() khi robot về home stance
- *       3. Tích hợp heading từ leg odometry (encoder) nếu cần
- *       4. yaw_rad chỉ dùng tham khảo, KHÔNG dùng làm feedback cân bằng
- *
- *  ── Tin cậy (dùng cho balance controller) ──────────────────────
- *  pitch_rad / roll_rad    : góc nghiêng (rad) — tham chiếu trọng lực
- *  pitch_rate / roll_rate  : tốc độ góc (rad/s)
- *
- *  ── Tin cậy ngắn hạn (dùng cho steering) ────────────────────────
- *  yaw_rate                : tốc độ xoay (rad/s) — chính xác tức thời
- *
- *  ── KHÔNG tin cậy dài hạn ────────────────────────────────────────
- *  yaw_rad                 : heading tuyệt đối — bị drift, chỉ tham khảo
- *
- *  ── Contact & impact ─────────────────────────────────────────────
- *  accel_norm_g            : |accel|/g — spike khi footstrike
- *  accel_vertical_g        : thành phần đứng theo body Z
- *  impact_detected         : footstrike / landing event
- *
- *  ── Fall detection ───────────────────────────────────────────────
- *  is_fallen               : |pitch| hoặc |roll| vượt ngưỡng
- *  is_stationary           : gyro noise nhỏ, robot đứng yên
- */
 struct LocomotionState {
-    // ── TIN CẬY — dùng cho balance PD/LQR ────────────────────────
-    float pitch_rad {0.f};     // rad  [-π/2,  π/2]
-    float roll_rad  {0.f};     // rad  [-π,    π  ]
-    float pitch_rate{0.f};     // rad/s
-    float roll_rate {0.f};     // rad/s
+    float pitch_rad {0.f};
+    float roll_rad  {0.f};
+    float yaw_rad   {0.f};
+    float pitch_rate{0.f};   // rad/s = gyr_y
+    float roll_rate {0.f};   // rad/s = gyr_x
+    float yaw_rate  {0.f};   // rad/s = gyr_z
 
-    // ── TIN CẬY ngắn hạn — dùng cho steering ─────────────────────
-    float yaw_rate  {0.f};     // rad/s — chính xác tức thời, không drift
-
-    // ── THAM KHẢO — drift dài hạn, không dùng cho control ─────────
-    // Dùng imu.zeroAngle() để reset về 0 khi cần
-    float yaw_rad   {0.f};     // rad — drift liên tục nếu đứng yên
-
-    // ── Contact & impact ──────────────────────────────────────────
     float accel_norm_g    {1.f};
     float accel_vertical_g{1.f};
-    bool  impact_detected {false};
 
-    // ── Fall & motion ─────────────────────────────────────────────
-    bool is_fallen    {false};
-    bool is_stationary{true};
+    bool  is_fallen      {false};
+    bool  is_stationary  {true};
+    bool  impact_detected{false};
 
-    // ── Timing ────────────────────────────────────────────────────
-    float dt_s{0.f};
-    std::chrono::steady_clock::time_point timestamp{};
+    float    dt_s{0.f};
+    uint64_t timestamp_ns{0};
 
-    // ── Thresholds ────────────────────────────────────────────────
     static constexpr float kFallThreshRad = 1.05f;   // ~60°
     static constexpr float kImpactThreshG = 2.5f;
-    static constexpr float kStationaryDps = 3.0f;
+    static constexpr float kStationaryRps = 0.052f;  // 3°/s
 };
 
-// ══════════════════════════════════════════════════════════════════
-//  Enums / constants
-// ══════════════════════════════════════════════════════════════════
 
-enum class OutputInterface : uint8_t {
-    USB   = 0x00,
-    RS485 = 0x01,
-    CAN   = 0x02,
-    VOFA  = 0x03,
-};
+// ═══════════════════════════════════════════════════════════════════
+//  Protocol constants
+// ═══════════════════════════════════════════════════════════════════
 
-static constexpr uint8_t  FRAME_HDR0     = 0x55;
-static constexpr uint8_t  FRAME_HDR1     = 0xAA;
-static constexpr uint8_t  FRAME_TAIL     = 0x0A;
-static constexpr uint16_t FRAME_LEN_STD  = 19;
-static constexpr uint16_t FRAME_LEN_QUAT = 23;
-static constexpr uint16_t FRAME_LEN      = FRAME_LEN_STD;
-
-static constexpr uint8_t  RID_ACCEL = 0x01;
-static constexpr uint8_t  RID_GYRO  = 0x02;
-static constexpr uint8_t  RID_EULER = 0x03;
-static constexpr uint8_t  RID_QUAT  = 0x04;
+inline constexpr uint8_t  FRAME_HDR0     = 0x55;
+inline constexpr uint8_t  FRAME_HDR1     = 0xAA;
+inline constexpr uint8_t  FRAME_TAIL     = 0x0A;
+inline constexpr uint16_t FRAME_LEN_STD  = 19;
+inline constexpr uint16_t FRAME_LEN_QUAT = 23;
+inline constexpr uint8_t  RID_ACCEL      = 0x01;
+inline constexpr uint8_t  RID_GYRO       = 0x02;
+inline constexpr uint8_t  RID_EULER      = 0x03;   // received but discarded
+inline constexpr uint8_t  RID_QUAT       = 0x04;
 
 } // namespace dm_imu

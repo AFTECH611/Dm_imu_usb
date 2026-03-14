@@ -60,8 +60,3 @@ message(STATUS "  Project  : ${PROJECT_NAME} v${PROJECT_VERSION}")
 message(STATUS "  Build    : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  Compiler : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "──────────────────────────────────────")
-
-# ── Calibration tool ─────────────────────────────────────────────
-add_executable(dm_imu_calibrate src/calibrate.cpp)
-target_link_libraries(dm_imu_calibrate PRIVATE dm_imu_lib)
-target_include_directories(dm_imu_calibrate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
